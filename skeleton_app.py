@@ -700,19 +700,33 @@ def main():
     else:
         chosen = paras
 
-    if not stl.button("Build skeleton", type="primary"):
-        return
+    if stl.button("Build skeleton", type="primary"):
+        with stl.spinner("Extracting…"):
+            blocks = build_units(chosen)
+            if not blocks:
+                stl.error("No sentences found.")
+                stl.session_state.pop("result", None)
+                return
+            order = block_order(len(blocks), int(seed))
+            text = render(blocks, order, include_frame, donor_note, int(seed))
+            try:
+                docx_bytes = to_docx_bytes(text)
+            except ImportError:
+                docx_bytes = None
+            # Everything the results panel needs is stored now. A download click
+            # reruns the script, at which point the Build button reads False, so
+            # the payload has to survive in session_state or the browser asks the
+            # server for a file that no longer exists.
+            stl.session_state["result"] = dict(
+                text=text, docx=docx_bytes, m=measurements(blocks),
+                checks=validate(blocks, order, text),
+                leaked=leak_check(blocks, text) if not include_frame else [],
+                framed=include_frame)
 
-    with stl.spinner("Extracting…"):
-        blocks = build_units(chosen)
-        if not blocks:
-            stl.error("No sentences found.")
-            return
-        order = block_order(len(blocks), int(seed))
-        text = render(blocks, order, include_frame, donor_note, int(seed))
-        m = measurements(blocks)
-        checks = validate(blocks, order, text)
-        leaked = leak_check(blocks, text) if include_frame is False else []
+    res = stl.session_state.get("result")
+    if not res:
+        return
+    text, m, checks, leaked = res["text"], res["m"], res["checks"], res["leaked"]
 
     stl.subheader("Measurements")
     a, b, c, d, e = stl.columns(5)
@@ -727,18 +741,18 @@ def main():
     stl.subheader("Validation")
     for label, ok in checks:
         stl.write(("✅ " if ok else "❌ ") + label)
-    if not include_frame and leaked:
+    if not res["framed"] and leaked:
         stl.warning("Content words found in the skeleton body: " + ", ".join(leaked[:40]))
 
     stl.subheader("Output")
-    stl.download_button("Download .txt", text.encode("utf8"),
+    stl.download_button("Download .txt", text.encode("utf8"), key="dl_txt",
                         file_name="Structural_Transplant_Skeleton.txt", mime="text/plain")
-    try:
-        stl.download_button("Download .docx", to_docx_bytes(text),
+    if res["docx"] is not None:
+        stl.download_button("Download .docx", res["docx"], key="dl_docx",
                             file_name="Structural_Transplant_Skeleton.docx",
                             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-    except ImportError:
-        stl.caption("Install python-docx for .docx output: pip install python-docx")
+    else:
+        stl.caption("python-docx is missing from requirements.txt, so only .txt is available.")
 
     stl.text_area("Preview (first 4,000 characters)", text[:4000], height=400)
 
