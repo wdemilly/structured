@@ -40,6 +40,7 @@ import io
 import random
 import re
 import statistics as st
+import unicodedata
 
 
 # Canonical content-blind order embedded in the Aug. 18 v6F prompt.
@@ -281,6 +282,9 @@ SKIP_TAGS = {"COMMA", "PERIOD", "QUOTE", "QMARK", "EXCL", "SEMICOLON", "APOST",
 
 
 def normalise(t):
+    # Normalize composed/decomposed Unicode letters before tokenization so
+    # accented donor words are treated as words and cannot leak as punctuation.
+    t = unicodedata.normalize("NFC", t)
     t = t.replace("\u201c", '"').replace("\u201d", '"')
     t = t.replace("\u2018", "'").replace("\u2019", "'")
     t = re.sub(r"\r\n?", "\n", t)
@@ -358,10 +362,10 @@ def sentences(p):
         buf = chunk
     if buf.strip():
         out.append(buf.strip())
-    return [s for s in out if re.search(r"[A-Za-z]", s)]
+    return [s for s in out if any(ch.isalpha() for ch in s)]
 
 
-TOKEN_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+(?:[.,]\d+)?|[^\sA-Za-z\d]")
+TOKEN_RE = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)?|\d+(?:[.,]\d+)?|[^\s]", re.UNICODE)
 
 
 def tokenise(s):
@@ -387,9 +391,9 @@ def word_count(tokens):
     n, i = 0, 0
     while i < len(tokens):
         t = tokens[i]
-        if re.match(r"^[A-Za-z]+$", t):
+        if t.isalpha():
             n += 1
-            if i + 2 < len(tokens) and tokens[i + 1] == "'" and re.match(r"^[A-Za-z]+$", tokens[i + 2]):
+            if i + 2 < len(tokens) and tokens[i + 1] == "'" and tokens[i + 2].isalpha():
                 i += 2
         elif re.match(r"^\d", t):
             n += 1
@@ -405,14 +409,14 @@ def tag_tokens(tokens):
         prev = tags[-1] if tags else None
         prev_word = tokens[i - 1].lower() if i else ""
         recent = [t.lower() for t in tokens[max(0, i - 3):i]]
-        first_alpha = not any(re.match(r"^[A-Za-z]", t) for t in tokens[:i])
+        first_alpha = not any(t[:1].isalpha() for t in tokens[:i])
 
         if tok == "'":
-            prev_alpha = bool(i and re.match(r"^[A-Za-z]+$", tokens[i - 1]))
-            next_alpha = bool(i + 1 < len(tokens) and re.match(r"^[A-Za-z]+$", tokens[i + 1]))
+            prev_alpha = bool(i and tokens[i - 1].isalpha())
+            next_alpha = bool(i + 1 < len(tokens) and tokens[i + 1].isalpha())
             tags.append("APOST" if (prev_alpha and next_alpha) else "QUOTE")
             continue
-        if not re.match(r"^[A-Za-z\d]", tok):
+        if not (tok[:1].isalpha() or tok[:1].isdigit()):
             tags.append(PUNCT_TAG.get(tok, "OTHER"))
             continue
         if low in NEG_STEM and i + 1 < len(tokens) and tokens[i + 1] == "'":
@@ -531,7 +535,7 @@ def tag_tokens(tokens):
             continue
         if low.endswith(("ous", "ful", "less", "able", "ible", "ive", "al", "ish", "y")) and len(low) > 4:
             nxt = tokens[i + 1].lower() if i + 1 < len(tokens) else ""
-            tags.append("ADJ" if re.match(r"^[A-Za-z]", nxt or "") else "NOUN")
+            tags.append("ADJ" if (nxt[:1].isalpha() if nxt else False) else "NOUN")
             continue
         tags.append("PROPN" if tok[0].isupper() and first_alpha and low not in DET else "NOUN")
     return tags
@@ -567,7 +571,7 @@ def status(sent):
     if q == 0:
         return "UNQUOTED"
     stripped = re.sub(r'"[^"]*"', "", sent).strip(" ,.;:!?-")
-    return "DIALOGUE" if not re.search(r"[A-Za-z]", stripped) else "MIXED"
+    return "DIALOGUE" if not any(ch.isalpha() for ch in stripped) else "MIXED"
 
 
 def terminal(sent):
@@ -611,7 +615,7 @@ def frame_sentence(tokens, tags):
     """Masked text of one sentence, with donor punctuation and spacing preserved."""
     out, first_done, open_quote = "", False, False
     for tok, tag in zip(tokens, tags):
-        is_alpha = bool(re.match(r"^[A-Za-z]", tok))
+        is_alpha = bool(tok[:1].isalpha())
         first_alpha = is_alpha and not first_done
         if is_alpha:
             first_done = True
@@ -822,7 +826,7 @@ def provenance_tsv(blocks):
 
 
 def best_window(paras, target, tol=0.15):
-    pw = [len(re.findall(r"[A-Za-z']+", p)) for p in paras]
+    pw = [word_count(tokenise(p)) for p in paras]
     best = None
     for i in range(len(paras)):
         tot = 0
@@ -991,7 +995,7 @@ def main():
             para_records.append(dict(source=n, source_para=pi, text=p))
 
     paras = [r["text"] for r in para_records]
-    total_words = sum(len(re.findall(r"[A-Za-z']+", p)) for p in paras)
+    total_words = sum(word_count(tokenise(p)) for p in paras)
     stl.write("**Loaded:** %d document(s), %d source paragraphs, %d words."
               % (len(docs), len(paras), total_words))
 
