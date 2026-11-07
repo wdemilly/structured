@@ -1,18 +1,20 @@
 """Chapter Draft Test
 
-Runs Prompt B through the Anthropic API with the same inputs an incognito
-claude.ai run receives, so the two drafts can be compared:
+Runs Prompt B through the Anthropic API so the draft can be read beside the
+one an incognito claude.ai window writes:
 
   system   = the published claude.ai system prompt for the model
-             + your profile preferences
+             + the API's own fiction instructions
   message  = the attached documents (Prompt B, the Book File)
              + "Write Chapter N."
 
 Nothing else is added to the request.
 
 Deploy on Streamlit Community Cloud with this file and requirements.txt.
-Put ANTHROPIC_API_KEY in the app's Secrets. Optionally add
-system_prompt.txt and preferences.txt beside this file so they load on start.
+Put ANTHROPIC_API_KEY in the app's Secrets. Optionally add system_prompt.txt
+beside this file so the system prompt loads on start. The fiction
+instructions are built in; an api_instructions.txt beside the file replaces
+them.
 """
 
 import datetime
@@ -32,6 +34,18 @@ AUTHOR = "Walter deMilly"
 MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "Other"]
 SYSTEM_PROMPT_PAGE = (
     "https://platform.claude.com/docs/en/release-notes/system-prompts/overview"
+)
+
+# The text of API_Fiction_Instructions_v1.docx in WritingApp.
+FICTION_INSTRUCTIONS = (
+    "Fiction instructions\n\n"
+    "These instructions apply when you write fiction from an attached prompt. "
+    "Follow that prompt for the prose. In the narration, keep two habits as well. "
+    "Dialogue belongs to the people speaking.\n\n"
+    "1. Set off an aside with commas or parentheses, or give it a sentence of its own. "
+    "Use no em dash.\n\n"
+    "2. Give a deliberate act to someone who can act, never to an abstraction such as "
+    "an argument, a chapter, a mechanism or a thesis."
 )
 
 
@@ -59,9 +73,9 @@ def file_to_text(uploaded) -> str:
     return uploaded.getvalue().decode("utf-8", errors="replace")
 
 
-def default_text(name: str) -> str:
+def default_text(name: str, fallback: str = "") -> str:
     path = HERE / name
-    return path.read_text(encoding="utf-8") if path.exists() else ""
+    return path.read_text(encoding="utf-8") if path.exists() else fallback
 
 
 def fill_date(system_text: str) -> str:
@@ -90,10 +104,14 @@ def word_count(text: str) -> int:
     return len(re.findall(r"[A-Za-z0-9’'\-]+", text))
 
 
-def chapter_part(reply: str) -> str:
-    """The longest stretch between --- rules: the chapter itself."""
-    chunks = re.split(r"(?m)^\s*(?:---|\*\*\*)\s*$", reply)
-    return max(chunks, key=word_count).strip() if chunks else reply
+def split_reply(reply: str):
+    """The chapter (the longest stretch between --- rules) and whatever follows it."""
+    chunks = [c.strip() for c in re.split(r"(?m)^\s*(?:---|\*\*\*)\s*$", reply)]
+    if not chunks:
+        return reply.strip(), ""
+    k = max(range(len(chunks)), key=lambda i: word_count(chunks[i]))
+    notes = "\n\n".join(c for c in chunks[k + 1:] if c)
+    return chunks[k], notes
 
 
 def smart_quotes(s: str) -> str:
@@ -158,9 +176,9 @@ def run_once(client, model, max_tokens, system_text, docs_xml, message, extra, s
         for piece in stream.text_stream:
             text += piece
             if len(text) % 400 < len(piece):
-                show.markdown(text[-3000:])
+                show.markdown(smart_quotes(text[-3000:]))
         final = stream.get_final_message()
-    show.markdown(text[-3000:])
+    show.markdown(smart_quotes(text[-3000:]))
     return text, final.usage, final.stop_reason
 
 
@@ -180,13 +198,14 @@ def main():
     st.set_page_config(page_title="Chapter Draft Test", layout="wide")
     st.title("Chapter Draft Test")
     st.caption(
-        "Sends the published claude.ai system prompt, your preferences, "
+        "Sends the published claude.ai system prompt, the API's own fiction instructions, "
         "Prompt B, the Book File and “Write Chapter N.” Nothing else."
     )
 
-    for key, fname in (("system_prompt", "system_prompt.txt"), ("preferences", "preferences.txt")):
-        if key not in st.session_state:
-            st.session_state[key] = default_text(fname)
+    if "system_prompt" not in st.session_state:
+        st.session_state.system_prompt = default_text("system_prompt.txt")
+    if "instructions" not in st.session_state:
+        st.session_state.instructions = default_text("api_instructions.txt", FICTION_INSTRUCTIONS)
     st.session_state.setdefault("results", [])
 
     with st.sidebar:
@@ -216,10 +235,14 @@ def main():
     remember_upload(st.file_uploader("Upload system prompt", type=["txt", "md", "docx"], key="sp_up"), "system_prompt")
     st.text_area("System prompt", key="system_prompt", height=160)
 
-    st.subheader("2. Your profile preferences")
-    st.markdown("Copy them from Settings › Profile. They reach incognito chats, so they belong in the test.")
-    remember_upload(st.file_uploader("Upload preferences", type=["txt", "md", "docx"], key="pr_up"), "preferences")
-    st.text_area("Preferences", key="preferences", height=120)
+    st.subheader("2. Instructions for the API")
+    st.markdown(
+        "These are the API's own fiction instructions, from API_Fiction_Instructions_v1.docx "
+        "in WritingApp. They're already filled in. Your instructions in Settings stay with "
+        "your editorial work and don't go into this test."
+    )
+    remember_upload(st.file_uploader("Upload other instructions", type=["txt", "md", "docx"], key="in_up"), "instructions")
+    st.text_area("Instructions", key="instructions", height=150)
 
     st.subheader("3. The two documents")
     c1, c2 = st.columns(2)
@@ -243,9 +266,9 @@ def main():
             return
 
         system_text = fill_date(st.session_state.system_prompt.strip())
-        prefs = st.session_state.preferences.strip()
-        if prefs:
-            system_text += f"\n\n<userPreferences>\n{prefs}\n</userPreferences>"
+        instructions = st.session_state.instructions.strip()
+        if instructions:
+            system_text += f"\n\n<userPreferences>\n{instructions}\n</userPreferences>"
         docs = [(prompt_file.name, docx_to_text(prompt_file)), (book_file.name, docx_to_text(book_file))]
         docs_xml = documents_block(docs)
 
@@ -253,7 +276,7 @@ def main():
             "model": model,
             "max_tokens": max_tokens,
             "system prompt (characters)": len(system_text),
-            "preferences included": bool(prefs),
+            "instructions": instructions.split("\n", 1)[0] if instructions else "none",
             "documents": [f"{n} ({word_count(t):,} words)" for n, t in docs],
             "message": message,
             "extra parameters": extra,
@@ -285,7 +308,7 @@ def main():
             st.session_state.results = []
             st.rerun()
     for i, r in enumerate(reversed(st.session_state.results)):
-        chap = chapter_part(r["reply"])
+        chap, notes = split_reply(r["reply"])
         name = f"Chapter_{r['chapter']:02d}_API_{r['model']}_run{r['run']}"
         with st.expander(
             f"Chapter {r['chapter']}, run {r['run']}, {r['model']}, {r['time']}: "
@@ -300,11 +323,14 @@ def main():
             d1, d2 = st.columns(2)
             d1.download_button("Chapter as Word file", to_docx(chap, name.replace("_", " ")),
                                file_name=name + ".docx", key=f"dx{i}")
-            d2.download_button("Whole reply as text", r["reply"].encode("utf-8"),
+            d2.download_button("Whole reply as text", smart_quotes(r["reply"]).encode("utf-8"),
                                file_name=name + "_full_reply.txt", key=f"tx{i}")
             with st.popover("What was sent"):
                 st.json(r["sent"])
-            st.markdown(r["reply"])
+            st.markdown(smart_quotes(chap))
+            if notes:
+                st.markdown("**The drafter's notes**")
+                st.markdown(smart_quotes(notes))
 
 
 if __name__ == "__main__":
