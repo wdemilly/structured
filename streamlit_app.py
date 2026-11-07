@@ -19,8 +19,9 @@ A chapter written elsewhere (an incognito window, say) can be reviewed on its
 own in section 6.
 
 Deploy on Streamlit Community Cloud with this file and requirements.txt.
-Put ANTHROPIC_API_KEY in the app's Secrets. Optionally add system_prompt.txt
-beside this file so the system prompt loads on start. The fiction
+Put ANTHROPIC_API_KEY in the app's Secrets. The app fetches the newest
+claude.ai system prompt for the chosen model from Anthropic's published page;
+a system_prompt.txt beside this file takes its place. The fiction
 instructions and the review instructions are built in; api_instructions.txt
 or review_instructions.txt beside the file replaces them.
 """
@@ -29,6 +30,7 @@ import datetime
 import io
 import json
 import re
+import urllib.request
 from pathlib import Path
 
 import streamlit as st
@@ -42,9 +44,7 @@ from docx.text.paragraph import Paragraph
 HERE = Path(__file__).parent
 AUTHOR = "Walter deMilly"
 MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "Other"]
-SYSTEM_PROMPT_PAGE = (
-    "https://platform.claude.com/docs/en/release-notes/system-prompts/overview"
-)
+SYSTEM_PROMPT_PAGE = "https://platform.claude.com/docs/en/release-notes/system-prompts/{model}"
 
 # The text of API_Fiction_Instructions_v2.docx in WritingApp.
 FICTION_INSTRUCTIONS = (
@@ -165,6 +165,29 @@ def fill_date(system_text: str) -> str:
     for key in ("{{currentDateTime}}", "{{currentDate}}", "{{current_date}}"):
         system_text = system_text.replace(key, stamp)
     return system_text
+
+
+def newest_prompt(page: str):
+    """The newest dated version on Anthropic's page: every fenced block under the first dated heading."""
+    for section in re.split(r"(?m)^## ", page)[1:]:
+        heading, _, body = section.partition("\n")
+        blocks = re.findall(r"(?ms)^```[^\n]*\n(.*?)^```[ \t]*$", body)
+        if blocks:
+            return heading.strip(), "".join(blocks).strip()
+    return "", ""
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_system_prompt(model: str):
+    """The newest claude.ai system prompt Anthropic has published for the model."""
+    url = SYSTEM_PROMPT_PAGE.format(model=model) + ".md"
+    req = urllib.request.Request(url, headers={"User-Agent": "Chapter-Draft-Test"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        page = r.read().decode("utf-8")
+    date, text = newest_prompt(page)
+    if len(text) < 5000 or "Claude" not in text:
+        raise ValueError("the page didn't hold a system prompt in the expected form")
+    return date, text
 
 
 def documents_block(docs) -> str:
@@ -658,15 +681,30 @@ def main():
             key = st.text_input("Anthropic API key", type="password")
 
     st.subheader("1. System prompt")
+    ss = st.session_state
     if (HERE / "system_prompt.txt").exists():
-        st.success("Loaded from system_prompt.txt beside the app. Replace that file when Anthropic "
-                   "publishes a new version.")
+        st.success("Loaded from system_prompt.txt beside the app.")
     else:
-        st.markdown(
-            f"Copy the claude.ai system prompt for the model from [Anthropic's page]"
-            f"({SYSTEM_PROMPT_PAGE}). Paste it here or upload it. To skip this step from now on, "
-            "save it as system_prompt.txt and put it in GitHub beside the app."
-        )
+        untouched = not ss.system_prompt.strip() or ss.system_prompt == ss.get("sp_fetched_text")
+        if model and untouched and ss.get("sp_fetched_model") != model:
+            ss.sp_fetched_model = model
+            try:
+                ss.sp_fetched_date, ss.sp_fetched_text = fetch_system_prompt(model)
+                ss.system_prompt = ss.sp_fetched_text
+                ss.sp_error = ""
+            except Exception as e:  # noqa: BLE001
+                ss.sp_fetched_text, ss.sp_error = "", str(e)
+                ss.system_prompt = ""
+        if ss.get("sp_fetched_text") and ss.system_prompt == ss.sp_fetched_text:
+            st.success(f"Fetched from Anthropic's page: the claude.ai system prompt for "
+                       f"{ss.sp_fetched_model}, the version of {ss.sp_fetched_date}. Nothing to paste.")
+        elif ss.get("sp_error") and not ss.system_prompt.strip():
+            st.warning(f"The app couldn't fetch the system prompt from Anthropic's page "
+                       f"({ss.sp_error}). Copy it from [the page]({SYSTEM_PROMPT_PAGE.format(model=model)}) "
+                       f"and paste it here or upload it.")
+            if st.button("Try fetching again"):
+                ss.sp_fetched_model = None
+                st.rerun()
     remember_upload(st.file_uploader("Upload system prompt", type=["txt", "md", "docx"], key="sp_up"), "system_prompt")
     st.text_area("System prompt", key="system_prompt", height=160)
 
