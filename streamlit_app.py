@@ -24,18 +24,27 @@ claude.ai system prompt for the chosen model from Anthropic's published page;
 a system_prompt.txt beside this file takes its place. The fiction
 instructions and the review instructions are built in; api_instructions.txt
 or review_instructions.txt beside the file replaces them.
+
+Section 4 takes one chapter or a run of chapters, e.g. "2 to 4". In a run, each
+chapter is drafted once and reviewed, and the reviewed chapter goes under
+CHAPTERS SO FAR before the next is written. The page then offers the Book File
+with the new chapters in it, with and without the catalogue.
 """
 
 import datetime
 import io
 import json
 import re
+import threading
+import time
 import urllib.request
+import zipfile
 from pathlib import Path
 
 import streamlit as st
 from anthropic import Anthropic
 from docx import Document
+from docx.enum.style import WD_STYLE_TYPE
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.table import Table
@@ -544,22 +553,146 @@ def notes_docx(rv, title: str) -> bytes:
     return save_bytes(doc)
 
 
+# ---------------------------------------------------------------- the Book File and its chapters
+
+CHAPTERS_MARK = "CHAPTERS SO FAR"
+CATALOGUE_MARK = "THE SENTENCE CATALOGUE"
+
+
+def chapter_title(book_doc, n: int) -> str:
+    """The chapter's line in the Book File's chapter list, such as '1. The Good Intent'."""
+    inside = False
+    for p in book_doc.paragraphs:
+        t = p.text.strip()
+        if t == "The chapter list":
+            inside = True
+            continue
+        if inside and t == "Decision register":
+            break
+        if inside and re.match(rf"^{n}\.\s+\S", t):
+            return t
+    return f"{n}. Chapter {n}"
+
+
+def insert_chapters_text(book_text: str, added) -> str:
+    """The Book File's text with this run's chapters placed under CHAPTERS SO FAR."""
+    if not added:
+        return book_text
+    block = []
+    for title, text in added:
+        block.append(title)
+        block.extend(p.replace("*", "") for p in paragraphs_of(text))
+    lines = book_text.split("\n")
+    marks = [i for i, line in enumerate(lines) if line.strip() == CHAPTERS_MARK]
+    if not marks:
+        return "\n".join(lines + ["", CHAPTERS_MARK] + block)
+    start = marks[0]
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].strip() == CATALOGUE_MARK), len(lines))
+    return "\n".join(lines[:end] + block + lines[end:])
+
+
+def _style(doc, *names):
+    """The first of the named paragraph styles the document has, as a style object."""
+    have = {s.name: s for s in doc.styles if s.type == WD_STYLE_TYPE.PARAGRAPH}
+    return next((have[n] for n in names if n in have), None)
+
+
+def book_file_with_chapters(book_bytes: bytes, added, keep_catalogue: bool = True) -> bytes:
+    """The attached Book File as a Word file, with this run's chapters under CHAPTERS SO FAR."""
+    doc = Document(io.BytesIO(book_bytes))
+    body = doc.element.body
+    paras = doc.paragraphs
+    catalogue = next((p for p in paras if p.text.strip() == CATALOGUE_MARK), None)
+    if not any(p.text.strip() == CHAPTERS_MARK for p in paras):
+        doc.add_paragraph(CHAPTERS_MARK, style=_style(doc, "Heading 2"))
+        catalogue = None
+    heading = _style(doc, "Heading 3")
+    first_style = _style(doc, "First Paragraph", "Body Text", "Normal")
+    body_style = _style(doc, "Body Text", "Normal")
+    new = []
+    for title, text in added:
+        new.append(doc.add_paragraph(title, style=heading))
+        for k, line in enumerate(paragraphs_of(text)):
+            p = doc.add_paragraph(style=first_style if k == 0 else body_style)
+            add_inline(p, line)
+            new.append(p)
+    if catalogue is not None:
+        for p in new:
+            catalogue._p.addprevious(p._p)
+        if not keep_catalogue:
+            el = catalogue._p
+            while el is not None and el.tag != qn("w:sectPr"):
+                nxt = el.getnext()
+                body.remove(el)
+                el = nxt
+    cp = doc.core_properties
+    cp.author = AUTHOR
+    cp.last_modified_by = AUTHOR
+    cp.modified = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    return save_bytes(doc)
+
+
+def book_file_names(book_name: str, first: int, last: int):
+    stem = Path(book_name).stem
+    span = f"Ch{first:02d}" if first == last else f"Ch{first:02d}_to_Ch{last:02d}"
+    return f"{stem}_with_{span}.docx", f"{stem}_NO_CATALOGUE_with_{span}.docx"
+
+
 # ---------------------------------------------------------------- the calls
 
-def stream_call(client, kwargs, show, echo=True):
-    text = ""
-    with client.messages.stream(**kwargs) as stream:
-        for piece in stream.text_stream:
-            text += piece
-            if echo and len(text) % 400 < len(piece):
-                show.markdown(smart_quotes(text[-3000:]))
-        final = stream.get_final_message()
-    if echo:
-        show.markdown(smart_quotes(text[-3000:]))
+EFFORTS = ["model default", "low", "medium", "high", "xhigh", "max"]
+
+
+def stream_call(client, kwargs, status, preview=None, label="The draft"):
+    """Runs the request on its own thread and keeps a progress line on the page while it runs."""
+    state = {"text": "", "phase": "sending", "done": False, "error": None, "final": None}
+
+    def work():
+        try:
+            with client.messages.stream(**kwargs) as stream:
+                for event in stream:
+                    kind = getattr(event, "type", "")
+                    if kind == "content_block_start":
+                        block = getattr(getattr(event, "content_block", None), "type", "")
+                        state["phase"] = "writing" if block == "text" else "thinking"
+                    elif kind == "content_block_delta":
+                        delta = getattr(event, "delta", None)
+                        if getattr(delta, "type", "") == "text_delta":
+                            state["text"] += delta.text
+                            state["phase"] = "writing"
+                state["final"] = stream.get_final_message()
+        except Exception as e:  # noqa: BLE001
+            state["error"] = e
+        finally:
+            state["done"] = True
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    started, shown = time.time(), 0
+    while not state["done"]:
+        mins, secs = divmod(int(time.time() - started), 60)
+        clock = f"{mins}:{secs:02d}"
+        if state["phase"] == "writing":
+            status.info(f"{label}: writing, {word_count(state['text']):,} words so far, {clock} elapsed.")
+            if preview is not None and len(state["text"]) - shown >= 400:
+                shown = len(state["text"])
+                preview.markdown(smart_quotes(state["text"][-3000:]))
+        elif state["phase"] == "thinking":
+            status.info(f"{label}: thinking, {clock} elapsed. Nothing appears until the writing starts. "
+                        f"Leave the page alone.")
+        else:
+            status.info(f"{label}: sending the documents, {clock} elapsed.")
+        time.sleep(2)
+    worker.join()
+    status.empty()
+    if state["error"] is not None:
+        raise state["error"]
+    final = state["final"]
+    text = "".join(getattr(b, "text", "") for b in final.content if getattr(b, "type", "") == "text")
     return text, final.usage, final.stop_reason
 
 
-def request(model, max_tokens, system_text, docs_xml, message, extra):
+def request(model, max_tokens, system_text, docs_xml, message, extra, effort):
     kwargs = dict(
         model=model,
         max_tokens=max_tokens,
@@ -573,23 +706,27 @@ def request(model, max_tokens, system_text, docs_xml, message, extra):
         }],
     )
     kwargs.update(extra)
+    config = dict(kwargs.get("output_config") or {})
+    config.pop("effort", None)  # the effort comes from the sidebar, never from the JSON box
+    if effort and effort != "model default":
+        config["effort"] = effort
+    if config:
+        kwargs["output_config"] = config
+    else:
+        kwargs.pop("output_config", None)
     return kwargs
 
 
-def run_once(client, model, max_tokens, system_text, docs_xml, message, extra, show):
-    return stream_call(client, request(model, max_tokens, system_text, docs_xml, message, extra), show)
-
-
-def review_chapter(client, model, max_tokens, system_text, docs, docs_xml, chapter_no,
-                   chapter_raw, instructions, extra, show):
+def review_chapter(client, model, max_tokens, effort, system_text, docs, docs_xml, chapter_no,
+                   chapter_raw, instructions, extra, status):
     paras = paragraphs_of(smart_quotes(chapter_raw))
     chapter = "\n\n".join(paras)
     places_text, found = places_to_look(paras, docs[1][1])
     message = (f"<chapter>\n{chapter}\n</chapter>\n\n<places>\n{places_text}\n</places>\n\n"
                f"{instructions}\n\nReview Chapter {chapter_no}.")
-    show.info("Reviewing the chapter.")
     reply, usage, stop = stream_call(
-        client, request(model, max_tokens, system_text, docs_xml, message, extra), show, echo=False)
+        client, request(model, max_tokens, system_text, docs_xml, message, extra, effort), status,
+        label=f"The review of Chapter {chapter_no}")
     fixes, questions = parse_review(reply)
     applied, skipped = apply_fixes(chapter, fixes)
     return dict(reply=reply, stop=stop, paras=paras, chapter=chapter, places=places_text,
@@ -605,6 +742,78 @@ def usage_dict(usage):
     }
 
 
+def tokens_line(u) -> str:
+    return (f"Tokens: {u['input']:,} in, {u['output']:,} out, {u['cache read']:,} read from cache, "
+            f"{u.get('cache write', 0):,} written to cache.")
+
+
+def final_chapter_text(result) -> str:
+    """The chapter as it goes into the Book File: the reviewed text when there is a review."""
+    rv = result.get("review")
+    if rv:
+        return apply_to_text(rv["chapter"], rv["applied"])
+    return "\n\n".join(paragraphs_of(smart_quotes(split_reply(result["reply"])[0])))
+
+
+def write_chapters(client, model, settings, system_text, prompt_doc, book, chapters, runs, extra,
+                   review_instructions, sent):
+    """Drafts each chapter in turn. In a run of several chapters each one is drafted once, reviewed
+    if review is on, and placed in the Book File before the next is written."""
+    series = len(chapters) > 1
+    runs = 1 if series else int(runs)
+    added, done = [], []
+    for n in chapters:
+        book_text = insert_chapters_text(book["text"], added)
+        docs = [prompt_doc, (book["name"], book_text)]
+        docs_xml = documents_block(docs)
+        message = f"Write Chapter {n}."
+        title = chapter_title(Document(io.BytesIO(book["bytes"])), n)
+        stopped = False
+        for k in range(1, runs + 1):
+            st.markdown(f"**Chapter {n}" + (f", run {k} of {runs}**" if runs > 1 else "**"))
+            status, preview = st.empty(), st.empty()
+            try:
+                reply, usage, stop = stream_call(
+                    client, request(model, settings["max_tokens"], system_text, docs_xml, message, extra,
+                                    settings["effort"]),
+                    status, preview, label=f"Chapter {n}")
+            except Exception as e:  # noqa: BLE001
+                st.error(f"The request for Chapter {n} failed: {e}")
+                stopped = True
+                break
+            now = datetime.datetime.now()
+            result = {
+                "chapter": n, "run": k, "model": model, "reply": reply, "stop": stop,
+                "sent": {**sent, "message": message,
+                         "documents": [f"{nm} ({word_count(t):,} words)" for nm, t in docs]},
+                "usage": usage_dict(usage), "time": now.strftime("%H:%M"), "stamp": now.strftime("%H%M"),
+                "title": title,
+            }
+            if stop == "max_tokens":
+                st.warning(f"Chapter {n} hit the token ceiling before it finished.")
+            elif settings["review_on"]:
+                try:
+                    result["review"] = review_chapter(
+                        client, model, settings["review_tokens"], settings["review_effort"], system_text,
+                        docs, docs_xml, n, split_reply(reply)[0], review_instructions, extra, status)
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Chapter {n} is safe, but its review failed: {e}")
+            preview.empty()
+            st.session_state.results.append(result)
+            done.append(result)
+            if stop == "max_tokens":
+                stopped = True
+        if stopped and series:
+            st.error(f"The run stopped at Chapter {n}. The chapters before it are under Results.")
+            break
+        if runs == 1 and not stopped:
+            added.append((title, final_chapter_text(done[-1])))
+    if added:
+        st.session_state.book_out = {"name": book["name"], "bytes": book["bytes"], "added": added,
+                                     "first": chapters[0], "last": chapters[0] + len(added) - 1}
+    return done
+
+
 # ---------------------------------------------------------------- the page
 
 def remember_upload(uploaded, state_key):
@@ -617,25 +826,75 @@ def remember_upload(uploaded, state_key):
         st.session_state[state_key + "_from"] = ident
 
 
-def show_review(rv, name, i):
+def parse_chapters(raw: str):
+    """'2' gives [2]; '2 to 4' or '2-4' gives [2, 3, 4]."""
+    m = re.fullmatch(r"\s*(\d+)\s*(?:(?:-|–|to)\s*(\d+))?\s*", raw or "")
+    if not m:
+        return []
+    first = int(m.group(1))
+    last = int(m.group(2) or first)
+    return list(range(first, last + 1)) if 1 <= first <= last else []
+
+
+def result_name(r) -> str:
+    if r.get("source"):
+        return r["source"]
+    stamp = f"_{r['stamp']}" if r.get("stamp") else ""
+    return f"Chapter_{r['chapter']:02d}_API_{r['model']}{stamp}_run{r['run']}"
+
+
+def result_files(r):
+    """Every file the page offers for one result, as (file name, bytes)."""
+    name = result_name(r)
+    title = name.replace("_", " ")
+    files = []
+    if not r.get("source"):
+        chap = split_reply(r["reply"])[0]
+        files.append((name + ".docx", to_docx(chap, title)))
+        files.append((name + "_full_reply.txt", smart_quotes(r["reply"]).encode("utf-8")))
+    rv = r.get("review")
+    if rv:
+        files.append((name + "_reviewed_tracked.docx", to_tracked_docx(rv["paras"], rv["applied"], title + " reviewed")))
+        files.append((name + "_reviewed_clean.docx",
+                      to_docx(apply_to_text(rv["chapter"], rv["applied"]), title + " reviewed")))
+        files.append((name + "_review_notes.docx", notes_docx(rv, title + " review notes")))
+    return files
+
+
+def book_out_files(bo):
+    full, bare = book_file_names(bo["name"], bo["first"], bo["last"])
+    return [(full, book_file_with_chapters(bo["bytes"], bo["added"], True)),
+            (bare, book_file_with_chapters(bo["bytes"], bo["added"], False))]
+
+
+def everything_zip(results, bo) -> bytes:
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for r in results:
+            for fname, data in result_files(r):
+                z.writestr(fname, data)
+        if bo:
+            for fname, data in book_out_files(bo):
+                z.writestr(fname, data)
+    return out.getvalue()
+
+
+def show_review(rv, files, i):
     st.write(
         f"Review: {len(rv['applied'])} fixes made, {len(rv['questions'])} questions for you, "
-        f"{len(rv['skipped'])} fixes the app couldn’t place.  Tokens: {rv['usage']['input']:,} in, "
-        f"{rv['usage']['output']:,} out, {rv['usage']['cache read']:,} read from cache."
+        f"{len(rv['skipped'])} fixes the app couldn’t place.  " + tokens_line(rv["usage"])
     )
     if rv["stop"] == "max_tokens":
         st.warning("The review hit its token ceiling, so it may be incomplete. Raise the review's "
                    "Max output tokens and review the chapter again in section 6.")
-    title = name.replace("_", " ")
-    c1, c2, c3 = st.columns(3)
-    c1.download_button("Reviewed chapter, tracked changes",
-                       to_tracked_docx(rv["paras"], rv["applied"], title + " reviewed"),
-                       file_name=name + "_reviewed_tracked.docx", key=f"rt{i}")
-    c2.download_button("Reviewed chapter, clean",
-                       to_docx(apply_to_text(rv["chapter"], rv["applied"]), title + " reviewed"),
-                       file_name=name + "_reviewed_clean.docx", key=f"rc{i}")
-    c3.download_button("Review notes", notes_docx(rv, title + " review notes"),
-                       file_name=name + "_review_notes.docx", key=f"rn{i}")
+    labels = [("_reviewed_tracked.docx", "Reviewed chapter, tracked changes"),
+              ("_reviewed_clean.docx", "Reviewed chapter, clean"),
+              ("_review_notes.docx", "Review notes")]
+    cols = st.columns(3)
+    for col, (end, label) in zip(cols, labels):
+        hit = next(((f, d) for f, d in files if f.endswith(end)), None)
+        if hit:
+            col.download_button(label, hit[1], file_name=hit[0], key=f"{end}{i}", on_click="ignore")
     if rv["questions"]:
         st.markdown("**Questions for you**")
         for q in rv["questions"]:
@@ -658,19 +917,27 @@ def main():
     if "review_instructions" not in st.session_state:
         st.session_state.review_instructions = default_text("review_instructions.txt", REVIEW_INSTRUCTIONS)
     st.session_state.setdefault("results", [])
+    st.session_state.setdefault("book_out", None)
 
     with st.sidebar:
         st.header("Model")
         choice = st.selectbox("Model", MODELS, index=0)
         model = st.text_input("Model string", "") if choice == "Other" else choice
-        max_tokens = st.number_input("Max output tokens", 4000, 128000, 32000, 1000)
-        runs = st.number_input("Runs of the same chapter", 1, 3, 1)
+        effort = st.selectbox("Effort for the draft", EFFORTS, index=EFFORTS.index("xhigh"),
+                              help="Your web chats run at Extra, which is xhigh.")
+        max_tokens = st.number_input("Max output tokens", 4000, 128000, 128000, 1000,
+                                     help="Thinking counts toward this. At xhigh a draft can use 80,000.")
+        runs = st.number_input("Runs of the same chapter", 1, 3, 1,
+                               help="For a single chapter. In a run of several chapters each is drafted once.")
         st.header("Review")
         review_on = st.checkbox("Review each draft after it’s written", value=True)
-        review_tokens = st.number_input("Max output tokens for a review", 4000, 64000, 16000, 1000)
+        review_effort = st.selectbox("Effort for the review", EFFORTS, index=0,
+                                     help="The model's default is medium, which is enough to check a chapter.")
+        review_tokens = st.number_input("Max output tokens for a review", 4000, 64000, 32000, 1000)
         with st.expander("Extra request parameters (JSON)"):
             extra_raw = st.text_area(
-                "Merged into every request. Leave empty to send the model's defaults.",
+                "Merged into every request. Leave empty to send the model's defaults. "
+                "The effort comes from the two boxes above, so an effort in here is ignored.",
                 "", height=80,
             )
         try:
@@ -722,17 +989,28 @@ def main():
     prompt_file = c1.file_uploader("Prompt B (.docx)", type=["docx"], key="pb")
     book_file = c2.file_uploader("Book File (.docx)", type=["docx"], key="bf")
 
-    st.subheader("4. The message")
-    chapter = st.text_input("Chapter number", "")
-    message = f"Write Chapter {chapter.strip()}." if chapter.strip().isdigit() else ""
-    if message:
-        st.code(message)
+    st.subheader("4. The chapters")
+    raw = st.text_input("Chapter, or a run of chapters", "", placeholder="e.g. 2, or 2 to 4")
+    chapters = parse_chapters(raw)
+    if raw.strip() and not chapters:
+        st.error("Give one chapter number, or a first and last, e.g. 2 to 4.")
+    if chapters:
+        st.code("\n".join(f"Write Chapter {n}." for n in chapters))
+    if len(chapters) > 1:
+        st.markdown(
+            "Each chapter is drafted once and reviewed if review is on. The reviewed chapter goes under "
+            "CHAPTERS SO FAR before the next one is written. At xhigh, allow about twenty minutes a chapter, "
+            "and keep this tab open and the computer awake until the run finishes."
+        )
 
     st.subheader("5. Review instructions")
     with st.expander("The instructions the reviewer reads. They're already filled in."):
         remember_upload(st.file_uploader("Upload other review instructions", type=["txt", "md", "docx"],
                                          key="rv_up"), "review_instructions")
         st.text_area("Review instructions", key="review_instructions", height=300)
+
+    settings = dict(max_tokens=int(max_tokens), effort=effort, review_on=review_on,
+                    review_tokens=int(review_tokens), review_effort=review_effort)
 
     def setup():
         try:
@@ -744,105 +1022,104 @@ def main():
         instructions = st.session_state.instructions.strip()
         if instructions:
             system_text += f"\n\n<userPreferences>\n{instructions}\n</userPreferences>"
-        docs = [(prompt_file.name, docx_to_text(prompt_file)), (book_file.name, docx_to_text(book_file))]
+        prompt_doc = (prompt_file.name, docx_to_text(prompt_file))
+        book_bytes = book_file.getvalue()
+        book = {"name": book_file.name, "bytes": book_bytes, "text": docx_to_text(io.BytesIO(book_bytes))}
         sent = {
             "model": model,
-            "max_tokens": max_tokens,
+            "max_tokens": int(max_tokens),
+            "effort": effort,
+            "review effort": review_effort if review_on else "no review",
             "system prompt (characters)": len(system_text),
             "instructions": instructions.split("\n", 1)[0] if instructions else "none",
-            "documents": [f"{n} ({word_count(t):,} words)" for n, t in docs],
-            "message": message,
             "extra parameters": extra,
         }
         client = Anthropic(api_key=key, timeout=1800, max_retries=2)
-        return extra, system_text, docs, documents_block(docs), sent, client
+        return extra, system_text, prompt_doc, book, sent, client
 
-    ready = all([model, key, st.session_state.system_prompt.strip(), prompt_file, book_file, message])
+    ready = all([model, key, st.session_state.system_prompt.strip(), prompt_file, book_file, chapters])
     if not ready:
         st.info("Fill in the system prompt, attach both documents and give the chapter number.")
-    if st.button("Write the chapter", type="primary", disabled=not ready):
+    label = "Write the chapters" if len(chapters) > 1 else "Write the chapter"
+    if st.button(label, type="primary", disabled=not ready):
         got = setup()
         if got:
-            extra, system_text, docs, docs_xml, sent, client = got
-            for k in range(1, int(runs) + 1):
-                st.markdown(f"**Run {k} of {runs}**")
-                show = st.empty()
-                try:
-                    reply, usage, stop = run_once(client, model, int(max_tokens), system_text, docs_xml,
-                                                  message, extra, show)
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"The request failed: {e}")
-                    break
-                result = {
-                    "chapter": int(chapter), "run": k, "model": model, "reply": reply,
-                    "stop": stop, "sent": sent, "usage": usage_dict(usage),
-                    "time": datetime.datetime.now().strftime("%H:%M"),
-                }
-                if review_on and stop != "max_tokens":
-                    try:
-                        result["review"] = review_chapter(
-                            client, model, int(review_tokens), system_text, docs, docs_xml, int(chapter),
-                            split_reply(reply)[0], st.session_state.review_instructions.strip(), extra, show)
-                    except Exception as e:  # noqa: BLE001
-                        st.error(f"The draft is safe, but the review failed: {e}")
-                st.session_state.results.append(result)
-                show.empty()
+            extra, system_text, prompt_doc, book, sent, client = got
+            st.session_state.book_out = None
+            write_chapters(client, model, settings, system_text, prompt_doc, book, chapters, runs, extra,
+                           st.session_state.review_instructions.strip(), sent)
 
     st.subheader("6. Review a chapter you already have")
     st.markdown(
         "Attach a chapter written elsewhere, e.g. in an incognito window, as a Word or text file. "
-        "It's reviewed against the documents in section 3, as the chapter numbered in section 4."
+        "It's reviewed against the documents in section 3, as the first chapter named in section 4."
     )
     own = st.file_uploader("Chapter to review (.docx or .txt)", type=["docx", "txt"], key="own")
     if st.button("Review this chapter", disabled=not (ready and own)):
         got = setup()
         if got:
-            extra, system_text, docs, docs_xml, sent, client = got
+            extra, system_text, prompt_doc, book, sent, client = got
+            n = chapters[0]
+            docs = [prompt_doc, (book["name"], book["text"])]
             text = split_reply(chapter_from_upload(own))[0]
-            show = st.empty()
+            status = st.empty()
             try:
-                rv = review_chapter(client, model, int(review_tokens), system_text, docs, docs_xml,
-                                    int(chapter), text, st.session_state.review_instructions.strip(),
-                                    extra, show)
+                rv = review_chapter(client, model, settings["review_tokens"], review_effort, system_text,
+                                    docs, documents_block(docs), n, text,
+                                    st.session_state.review_instructions.strip(), extra, status)
+                now = datetime.datetime.now()
                 st.session_state.results.append({
-                    "chapter": int(chapter), "run": 0, "model": model, "reply": text, "stop": "",
-                    "sent": {**sent, "message": f"Review Chapter {int(chapter)}."},
-                    "usage": rv["usage"], "time": datetime.datetime.now().strftime("%H:%M"),
+                    "chapter": n, "run": 0, "model": model, "reply": text, "stop": "",
+                    "sent": {**sent, "message": f"Review Chapter {n}."},
+                    "usage": rv["usage"], "time": now.strftime("%H:%M"), "stamp": now.strftime("%H%M"),
                     "source": Path(own.name).stem, "review": rv,
                 })
             except Exception as e:  # noqa: BLE001
                 st.error(f"The review failed: {e}")
-            show.empty()
+            status.empty()
 
-    if st.session_state.results:
+    results = st.session_state.results
+    bo = st.session_state.book_out
+    if results:
         st.subheader("Results")
-        if st.button("Clear results"):
+        st.caption("Downloading never restarts the app, so a download is safe while nothing is running.")
+        a1, a2 = st.columns(2)
+        a1.download_button("Download everything (.zip)", everything_zip(results, bo),
+                           file_name=f"Chapter_Draft_Test_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+                           key="zip_all", on_click="ignore", type="primary")
+        if a2.button("Clear results"):
             st.session_state.results = []
+            st.session_state.book_out = None
             st.rerun()
-    for i, r in enumerate(reversed(st.session_state.results)):
+    if bo:
+        names = [t for t, _ in bo["added"]]
+        span = f"Chapter {bo['first']}" if bo["first"] == bo["last"] else f"Chapters {bo['first']} to {bo['last']}"
+        with st.expander(f"The Book File with {span} added", expanded=True):
+            st.write("Added under CHAPTERS SO FAR, as reviewed: " + "; ".join(names) + ".")
+            b1, b2 = st.columns(2)
+            for col, (fname, data), label in zip((b1, b2), book_out_files(bo),
+                                                 ("Book File with the chapters", "The same, NO_CATALOGUE")):
+                col.download_button(label, data, file_name=fname, key=f"bo_{label}", on_click="ignore")
+    for i, r in enumerate(reversed(results)):
         chap, notes = split_reply(r["reply"])
+        files = result_files(r)
         if r.get("source"):
-            name = r["source"]
             label = f"Chapter {r['chapter']}, review of {r['source']}, {r['model']}, {r['time']}"
         else:
-            name = f"Chapter_{r['chapter']:02d}_API_{r['model']}_run{r['run']}"
             label = f"Chapter {r['chapter']}, run {r['run']}, {r['model']}, {r['time']}"
         with st.expander(f"{label}: {word_count(chap):,} words", expanded=(i == 0)):
             if not r.get("source"):
-                st.write(
-                    f"Stop reason: {r['stop']}.  Tokens: {r['usage']['input']:,} in, "
-                    f"{r['usage']['output']:,} out, {r['usage']['cache read']:,} read from cache."
-                )
+                st.write(f"Stop reason: {r['stop']}.  " + tokens_line(r["usage"]))
                 if r["stop"] == "max_tokens":
                     st.warning("The reply hit the token ceiling. Raise Max output tokens and run again.")
                 d1, d2 = st.columns(2)
-                d1.download_button("Chapter as Word file", to_docx(chap, name.replace("_", " ")),
-                                   file_name=name + ".docx", key=f"dx{i}")
-                d2.download_button("Whole reply as text", smart_quotes(r["reply"]).encode("utf-8"),
-                                   file_name=name + "_full_reply.txt", key=f"tx{i}")
+                d1.download_button("Chapter as Word file", files[0][1], file_name=files[0][0],
+                                   key=f"dx{i}", on_click="ignore")
+                d2.download_button("Whole reply as text", files[1][1], file_name=files[1][0],
+                                   key=f"tx{i}", on_click="ignore")
             rv = r.get("review")
             if rv:
-                show_review(rv, name, i)
+                show_review(rv, files, i)
             with st.popover("What was sent"):
                 st.json(r["sent"])
             tabs = st.tabs(["The draft", "After review", "Review details"] if rv else ["The draft"])
